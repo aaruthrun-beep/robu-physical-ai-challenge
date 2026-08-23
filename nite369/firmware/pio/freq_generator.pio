@@ -1,0 +1,32 @@
+;
+; Copyright (c) 2025 Viola Zsolt.
+;
+; License: MIT
+;
+; The linuxcnc driver computes the steps need to out in the given time (servo-thread)
+; core0 pushes payload: [step_count(10) | delay(22)]
+; out x,10 extracts step count; out y,22 extracts delay into Y, then mov isr,y saves it
+; each step restores delay from ISR so OSR consumption doesn't affect later steps
+
+.pio_version 0
+
+.program freq_generator
+
+    set pindirs, 1   ;
+again:
+    pull block       ; OSR = [steps(10) | delay(22)]
+    out x, 10        ; X = steps, OSR <<= 10 → OSR = delay << 10
+    out y, 22        ; Y = delay (extracted from OSR[31:10]), OSR = 0
+    mov isr, y       ; ISR = delay (preserved for all N steps)
+loop0:
+    set pins, 1      ; STEP HIGH
+    set y, 24        ;
+loop1:
+    nop [8]          ;
+    jmp y--, loop1   ;
+    set pins, 0      ; STEP LOW
+    mov y, isr       ; Y = delay (restored from ISR)
+loop2:
+    jmp y--, loop2   ;
+    jmp x--, loop0   ;
+    jmp again        ;

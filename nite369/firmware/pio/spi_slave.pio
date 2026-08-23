@@ -1,0 +1,98 @@
+;
+; PIO SPI Slave — Mode 0 (CPOL=0, CPHA=0)
+;
+; For the Nite 369 SPI communication test between Master and Slave Picos.
+;
+; SCK idle low, data sampled on rising edge, output on falling edge.
+;
+; Pin mapping (set via sm_config):
+;   out pin:    MISO (GP3) — data output to master
+;   in pins:    MOSI (GP4) — data input from master
+;   jmp pin:    CS   (GP5) — chip select, active low
+;   SCK (GP2) — read via wait instruction (not mapped as PIO pin function)
+;
+; Autopull: 8-bit, enabled (TX FIFO → OSR when empty)
+; Autopush: 8-bit, enabled (ISR → RX FIFO when full)
+;
+; CPU protocol:
+;   1. Write 4 TX bytes to PIO TX FIFO (pio_sm_put_blocking)
+;   2. Read 4 RX bytes from PIO RX FIFO (pio_sm_get_blocking)
+;   3. The PIO handles all SPI timing automatically
+
+.program pio_spi_slave
+
+.wrap_target
+    ; ── Wait for CS assertion (active low) ──
+    wait 0 pin 5
+
+newbyte:
+    set x, 7                ; Bit counter: 7 more after first out
+
+bitloop:
+    out pins, 1             ; Drive MISO bit (master samples this on rising edge)
+    wait 1 pin 2            ; SCK rising: master samples MISO, slave samples MOSI
+    in pins, 1              ; Sample MOSI bit → shift into ISR
+    wait 0 pin 2            ; SCK falling: master changes MOSI for next bit
+    jmp x-- bitloop         ; Loop for all 8 bits
+
+    ; Autopush: ISR (8-bit) → RX FIFO
+    ; Autopull: TX FIFO → OSR
+
+    ; Check if CS is still low → master wants another byte
+    jmp !pin 5 newbyte
+.wrap
+    ; CS is high → wrap to top and wait for next CS assertion
+
+% c-sdk {
+#include "hardware/gpio.h"
+#include "hardware/pio.h"
+
+/**
+ * @brief Initialise a PIO state machine as an SPI slave (mode 0).
+ *
+ * @param pio      PIO block (pio0 or pio1)
+ * @param sm       State machine number (0-3)
+ * @param offset   Program offset from pio_add_program()
+ * @param pin_sck  SCK GPIO number (input)
+ * @param pin_mosi MOSI GPIO number (input)
+ * @param pin_miso MISO GPIO number (output)
+ * @param pin_cs   CS GPIO number (input, active low)
+ */
+static inline void pio_spi_slave_init(PIO pio, uint sm, uint offset,
+                                       uint pin_sck, uint pin_mosi,
+                                       uint pin_miso, uint pin_cs) {
+    // Configure GPIOs for PIO
+    pio_gpio_init(pio, pin_sck);
+    pio_gpio_init(pio, pin_mosi);
+    pio_gpio_init(pio, pin_miso);
+    pio_gpio_init(pio, pin_cs);
+
+    // Set MISO as output; all others are inputs by default
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_miso, 1, true);
+
+    // Get default config for this program
+    pio_sm_config c = pio_spi_slave_program_get_default_config(offset);
+
+    // out: MISO (1 pin, data output to master)
+    sm_config_set_out_pins(&c, pin_miso, 1);
+
+    // in: MOSI (data input from master)
+    sm_config_set_in_pins(&c, pin_mosi);
+
+    // jmp: CS (used in jmp !pin to check if still active)
+    sm_config_set_jmp_pin(&c, pin_cs);
+
+    // Autopull: shift left, enabled, threshold 8 bits
+    sm_config_set_out_shift(&c, false, true, 8);
+
+    // Autopush: shift left, enabled, threshold 8 bits
+    sm_config_set_in_shift(&c, false, true, 8);
+
+    // Clock divider: run at full speed (125 MHz ÷ 1.0 = 125 MHz)
+    sm_config_set_clkdiv(&c, 1.0f);
+
+    // Initialise and enable state machine
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

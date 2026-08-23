@@ -1,0 +1,7 @@
+# GUI (Tkinter) ships with Python — nothing needed for the app itself.
+# For the workspace-map PNG generator:
+matplotlib>=3.5
+# For phase-2 real hardware over CAN (not needed for simulation):
+python-can>=4.0
+# For running the unit tests:
+pytest>=7.0

@@ -1,0 +1,26 @@
+.program i2c
+.side_set 1 opt
+
+; Software I2C master for AS5600 encoders
+; SCL is side-set bit 0
+; SDA is the OUT pin
+
+do_start:
+    set pins, 1 side 1 [7] ; SDA high, SCL high
+    set pins, 0 side 1 [7] ; SDA low, SCL high (start)
+    set pins, 0 side 0 [7] ; SDA low, SCL low
+
+do_stop:
+    set pins, 0 side 0 [7] ; SDA low, SCL low
+    set pins, 0 side 1 [7] ; SDA low, SCL high
+    set pins, 1 side 1 [7] ; SDA high, SCL high (stop)
+
+bit_loop:
+    out pins, 1 side 0 [7] ; Out bit, SCL low
+    nop         side 1 [7] ; SCL high
+    jmp !osre bit_loop [7]
+
+byte_read:
+    set pins, 1 side 0 [7] ; SDA floating (input), SCL low
+    in pins, 1  side 1 [7] ; Read SDA, SCL high
+    jmp !osre byte_read [7]

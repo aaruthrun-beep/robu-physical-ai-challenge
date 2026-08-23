@@ -1,0 +1,34 @@
+# Build artifacts
+build/
+build_enc/
+build_s2/
+build_wipe/
+*.uf2
+*.elf
+*.o
+*.d
+*.pio.h
+cmake-build-*/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log

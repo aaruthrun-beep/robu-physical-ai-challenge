@@ -1,0 +1,113 @@
+{
+  "theme": "high_contrast",
+  "render_backend": "pybullet",
+  "language": "en",
+  "simulation": {
+    "gravity": [
+      0,
+      0,
+      -9.81
+    ],
+    "timestep": 0.004166666666666667,
+    "real_time": true
+  },
+  "communication": {
+    "mode": "open_loop",
+    "transport": "serial",
+    "protocol": "grbl",
+    "serial": {
+      "port": "COM1",
+      "baud_rate": 115200,
+      "data_bits": 8,
+      "stop_bits": 1,
+      "parity": "none"
+    },
+    "ethernet": {
+      "host": "192.168.1.100",
+      "port": 8080,
+      "timeout": 5.0
+    },
+    "custom_protocol_path": ""
+  },
+  "control": {
+    "server_port": 8765,
+    "can_interface": "virtual",
+    "can_channel": 0,
+    "serial_port": "COM3",
+    "serial_baud": 115200
+  },
+  "joint_limits": {
+    "x": [
+      -180,
+      180
+    ],
+    "y": [
+      -90,
+      90
+    ],
+    "z": [
+      -135,
+      135
+    ],
+    "a": [
+      -180,
+      180
+    ],
+    "b": [
+      -120,
+      120
+    ],
+    "c": [
+      -180,
+      180
+    ]
+  },
+  "gripper": {
+    "open_pwm": 2500,
+    "close_pwm": 500
+  },
+  "tmc": {
+    "default_preset": "1.0A Low Noise",
+    "gconf": 192,
+    "chopconf": 65619,
+    "ihold_irun": 266000,
+    "microsteps": 3,
+    "spreadcycle": true,
+    "interpolation": true
+  },
+  "encoder": {
+    "poll_interval_ms": 100,
+    "auto_poll": true,
+    "zero_offsets": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "as5600_resolution": 12,
+    "as5600_degrees_per_lsb": 0.0879
+  },
+  "nite": {
+    "ethernet_host": "192.168.1.100",
+    "ethernet_port": 8765,
+    "serial_port": "COM3",
+    "serial_baud": 115200,
+    "timeout": 5.0
+  },
+  "viewport": {
+    "camera_distance": 2.0,
+    "camera_yaw": 45.0,
+    "camera_pitch": -30.0,
+    "grid_enabled": true,
+    "grid_size": 1.0,
+    "grid_spacing": 0.1
+  },
+  "program": {
+    "default_speed": 50,
+    "default_delay": 0.5,
+    "default_transition": 1.5,
+    "default_feed_rate": 600
+  }
+}
