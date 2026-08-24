@@ -81,6 +81,15 @@ def capture_loop(dev, w, h, fps):
             with _frame_lock:
                 _latest_frame = frame
             _frame_event.set()
+            # Run YOLO detection + draw overlay
+            try:
+                dets = detector.detect(frame)
+                det_frame = draw_detections(frame, dets)
+                with _det_lock:
+                    _latest_det_frame = det_frame
+                    _detections[:] = dets
+            except Exception:
+                pass
         else:
             time.sleep(0.05)
             continue
@@ -91,6 +100,19 @@ def capture_loop(dev, w, h, fps):
 def get_frame():
     with _frame_lock:
         return _latest_frame.copy() if _latest_frame is not None else None
+
+def get_det_frame():
+    with _det_lock:
+        return _latest_det_frame.copy() if _latest_det_frame is not None else None
+
+def get_detections():
+    with _det_lock:
+        return list(_detections)
+
+def tick_decision():
+    dets = get_detections()
+    if dets and decision.enabled:
+        decision.process(dets)
 
 # ══════════════════════════════════════════════════════════════════
 # SCARA KINEMATICS (2-link planar)
@@ -355,7 +377,175 @@ class CANBus:
 
 can_bus = CANBus()
 
-# ══════════════════════════════════════════════════════════════════
+# ================================================================
+# YOLO OBJECT DETECTOR
+# ================================================================
+_det_lock = threading.Lock()
+_latest_det_frame = None   # frame with bounding boxes drawn
+_detections = []           # latest detection results
+_detect_fps = 0.0
+class YoloDetector:
+    """YOLOv8 detector with fallback to color-blob detection."""
+    def __init__(self):
+        self.model = None
+        self.names = []
+        self.yolo_ok = False
+        try:
+            from ultralytics import YOLO
+            self.model = YOLO("yolov8n.pt")
+            self.names = self.model.names
+            self.yolo_ok = True
+        except Exception as e:
+            print(f"  [YoloDetector] ultralytics not available: {e}", flush=True)
+    def detect(self, frame):
+        """Run detection, return list of {label, conf, bbox:[x1,y1,x2,y2]}"""
+        if self.yolo_ok and self.model is not None:
+            try:
+                results = self.model(frame, verbose=False, conf=0.35, imgsz=320)
+                dets = []
+                for r in results:
+                    for box in r.boxes:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                        conf = float(box.conf[0])
+                        cls = int(box.cls[0])
+                        label = self.names[cls] if cls < len(self.names) else str(cls)
+                        dets.append({"label": label, "conf": round(conf, 3), "bbox": [x1, y1, x2, y2]})
+                return dets
+            except Exception:
+                pass
+        # Fallback: detect colored objects via HSV
+        return self._color_detect(frame)
+    def _color_detect(self, frame):
+        """Simple HSV color-blob fallback when YOLO unavailable."""
+        import cv2
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        dets = []
+        colors = {
+            "red":    ([0, 70, 50], [10, 255, 255]),
+            "green":  ([35, 70, 50], [85, 255, 255]),
+            "blue":   ([100, 70, 50], [130, 255, 255]),
+            "yellow": ([20, 70, 50], [35, 255, 255]),
+        }
+        for name, (lo, hi) in colors.items():
+            mask = cv2.inRange(hsv, lo, hi)
+            mask = cv2.erode(mask, None, 2)
+            mask = cv2.dilate(mask, None, 2)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area > 500:
+                    x, y, w, h = cv2.boundingRect(c)
+                    dets.append({"label": name, "conf": round(min(1.0, area / 5000), 2), "bbox": [x, y, x + w, y + h]})
+        return dets
+
+def draw_detections(frame, dets):
+    """Draw bounding boxes and labels on frame."""
+    import cv2
+    overlay = frame.copy()
+    for d in dets:
+        x1, y1, x2, y2 = d["bbox"]
+        label = f"{d['label']} {d['conf']:.0%}"
+        color = (0, 255, 0)
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(overlay, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+        cv2.putText(overlay, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+    return overlay
+
+detector = YoloDetector()
+
+# ================================================================
+# DECISION ENGINE — maps detections to robot commands
+# ================================================================
+class DecisionEngine:
+    """Autonomous pick-and-place: detect objects, compute SCARA IK,
+    send CAN commands to move to the object's position."""
+    def __init__(self):
+        self.enabled = False
+        self.mode = "idle"  # idle, scanning, reaching, picking, placing
+        self.lock = threading.Lock()
+        self.log = []
+        self.target_label = None   # what object to pick (or None = nearest)
+        self.pick_zone = (200, 100)  # mm — where to place picked objects
+        self.cam_w = CAMERA_W
+        self.cam_h = CAMERA_H
+        # Map camera pixel X to SCARA X (mm). Camera looks down at workspace.
+        # Workspace: x=[-300,300] mm, y=[0,600] mm
+        self.x_range = (-300, 300)  # SCARA x range mm
+        self.y_range = (0, 600)     # SCARA y range mm
+    def pixel_to_scara(self, px, py):
+        """Convert camera pixel to SCARA workspace coordinates (mm)."""
+        sx = self.x_range[0] + (px / self.cam_w) * (self.x_range[1] - self.x_range[0])
+        sy = self.y_range[0] + (1.0 - py / self.cam_h) * (self.y_range[1] - self.y_range[0])
+        return round(sx, 1), round(sy, 1)
+    def process(self, dets):
+        """Main decision loop — called each frame when enabled."""
+        if not self.enabled:
+            return
+        with self.lock:
+            self.mode = "scanning"
+        # Filter for target label or pick the largest
+        pick = None
+        if dets:
+            if self.target_label:
+                candidates = [d for d in dets if d["label"] == self.target_label]
+                if candidates:
+                    pick = max(candidates, key=lambda d: (d["bbox"][2]-d["bbox"][0]) * (d["bbox"][3]-d["bbox"][1]))
+            if pick is None:
+                pick = max(dets, key=lambda d: (d["bbox"][2]-d["bbox"][0]) * (d["bbox"][3]-d["bbox"][1]))
+        if pick is None:
+            with self.lock:
+                self.mode = "scanning"
+            return
+        # Convert pixel center to SCARA mm
+        cx = (pick["bbox"][0] + pick["bbox"][2]) / 2
+        cy = (pick["bbox"][1] + pick["bbox"][3]) / 2
+        sx, sy = self.pixel_to_scara(cx, cy)
+        # Compute IK
+        angles = scara.ik(sx, sy)
+        if angles is None:
+            self._log(f"OUT OF REACH: {pick['label']} at ({sx},{sy})mm")
+            return
+        self._log(f"TARGET: {pick['label']} ({sx:.0f},{sy:.0f})mm -> J1={angles[0]:.1f} J2={angles[1]:.1f}")
+        # Send CAN commands to SCARA motors
+        ok1 = can_bus.send_position(0x10, angles[0])
+        ok2 = can_bus.send_position(0x11, angles[1])
+        can_ok = ok1 and ok2
+        if not can_ok:
+            self._log(f"CAN UNAVAILABLE: cannot move SCARA to ({sx},{sy})mm")
+        # Also send robot command if link is up
+        if robot_link.conn:
+            cmd = f"#M1,{angles[0]:.1f}"
+            robot_link.send(cmd)
+            cmd2 = f"#M2,{angles[1]:.1f}"
+            robot_link.send(cmd2)
+            self._log(f"ROBOT CMD: {cmd} / {cmd2}")
+        with self.lock:
+            self.mode = "reaching"
+    def _log(self, msg):
+        ts = time.strftime("%H:%M:%S")
+        entry = f"{ts} {msg}"
+        with self.lock:
+            self.log.append(entry)
+            if len(self.log) > 100:
+                self.log.pop(0)
+        print(f"  [DECISION] {msg}", flush=True)
+    def snapshot(self):
+        with self.lock:
+            return {
+                "enabled": self.enabled,
+                "mode": self.mode,
+                "target_label": self.target_label,
+                "log": list(self.log[-20:]),
+            }
+    def toggle(self):
+        self.enabled = not self.enabled
+        self._log(f"Decision engine {'ENABLED' if self.enabled else 'DISABLED'}")
+        return self.enabled
+
+decision = DecisionEngine()
+
+# ================================================================
 # SERIAL SCANNER
 # ══════════════════════════════════════════════════════════════════
 def scan_serial_ports():
@@ -555,6 +745,7 @@ body{background:#111;color:#b0b0b0;font:11px/1.3 'Courier New',monospace;overflo
       <div class="tab" onclick="showTab(2,this)">HEXAPOD</div>
       <div class="tab" onclick="showTab(3,this)">I/O</div>
       <div class="tab" onclick="showTab(4,this)">PROGRAM</div>
+      <div class="tab" onclick="showTab(5,this)">VISION</div>
     </div>
     <!-- Panel: JOG (SCARA) -->
     <div class="panel active" id="p0">
@@ -653,8 +844,32 @@ body{background:#111;color:#b0b0b0;font:11px/1.3 'Courier New',monospace;overflo
         <div class="readout-title">EXECUTION</div>
         <div class="srow"><span class="sk">Status</span><span class="sv" style="color:#333">STOPPED</span></div>
         <div class="srow"><span class="sk">Line</span><span class="sv" style="color:#333">---</span></div>
-        <div class="srow"><span class="sk">Cycle</span><<span class="sv" style="color:#333">---</span></div>
+        <div class="srow"><span class="sk">Cycle</span><span class="sv" style="color:#333">---</span></div>
       </div>
+    </div>
+    <!-- Panel: VISION (YOLO) -->
+    <div class="panel" id="p5">
+      <div class="cam-box">
+        <img id="det-video" src="/stream_det?0">
+        <div class="cam-bar"><span id="det-st">CONNECTING</span><span>YOLOv8 DETECTION</span><span id="det-fps"></span></div>
+      </div>
+      <div class="readout" style="margin-top:4px">
+        <div class="readout-title">DETECTION RESULTS</div>
+        <div id="det-list" style="max-height:100px;overflow-y:auto"><div class="srow"><span class="sk" style="color:#333">Waiting...</span></div></div>
+      </div>
+      <div class="readout">
+        <div class="readout-title">DECISION ENGINE</div>
+        <div class="srow"><span class="sk">Status</span><span id="dec-mode" class="stag stag-off">OFF</span></div>
+        <div class="srow"><span class="sk">Target</span><span id="dec-target" style="color:#0f0">ANY</span></div>
+        <div style="margin-top:4px;display:flex;gap:3px">
+          <button class="btn" onclick="toggleDecision()">ENABLE / DISABLE</button>
+          <button class="btn btn-o" onclick="setDecTarget('')">ANY</button>
+          <button class="btn btn-o" onclick="setDecTarget('red')">RED</button>
+          <button class="btn btn-o" onclick="setDecTarget('green')">GREEN</button>
+          <button class="btn btn-o" onclick="setDecTarget('blue')">BLUE</button>
+        </div>
+      </div>
+      <div class="log-box" id="dec-log" style="max-height:80px"></div>
     </div>
     <!-- Log -->
     <div class="log-box" id="log"></div>
@@ -884,6 +1099,55 @@ function scanNet(){
 // ═══ Rescan ═══
 function rescan(){log('RE-SCANNING...');fetch('/api/rescan').then(r=>r.json()).then(d=>{log('DONE '+JSON.stringify(d));pollStatus()})}
 
+// ═══ Vision / YOLO ═══
+var detImg=document.getElementById('det-video'),detIdx=0,detFc=0,detLt=Date.now();
+function loopDet(){
+  var img=new Image();
+  img.onload=function(){detImg.src=img.src;detFc++;var n=Date.now();if(n-detLt>1000){document.getElementById('det-fps').textContent=detFc+' fps';detFc=0;detLt=n}document.getElementById('det-st').textContent='LIVE';document.getElementById('det-st').style.color='#0f0';setTimeout(loopDet,80)};
+  img.onerror=function(){setTimeout(loopDet,500);document.getElementById('det-st').textContent='OFFLINE';document.getElementById('det-st').style.color='#f00'};
+  img.src='/stream_det?'+(detIdx++);
+}
+loopDet();
+
+function pollDetections(){
+  fetch('/api/detections').then(r=>r.json()).then(d=>{
+    var h='';
+    if(!d.detections||!d.detections.length){h='<div class="srow"><span class="sk" style="color:#333">No objects</span></div>'}
+    else{d.detections.forEach(function(det){
+      h+='<div class="srow"><span class="sk">'+det.label+'</span><span style="color:#0f0">'+(det.conf*100).toFixed(0)+'%</span><span style="color:#444">['+det.bbox.join(',')+']</span></div>'
+    })}
+    document.getElementById('det-list').innerHTML=h;
+  }).catch(function(){});
+  setTimeout(pollDetections,500);
+}
+pollDetections();
+
+function pollDecision(){
+  fetch('/api/decision').then(r=>r.json()).then(d=>{
+    document.getElementById('dec-mode').textContent=d.mode.toUpperCase();
+    document.getElementById('dec-mode').className='stag '+(d.enabled?'stag-on':'stag-off');
+    document.getElementById('dec-target').textContent=d.target_label||'ANY';
+    var el=document.getElementById('dec-log');
+    var h='';(d.log||[]).forEach(function(l){h+='<div style="color:#0a0">'+l+'</div>'});
+    el.innerHTML=h;
+  }).catch(function(){});
+  setTimeout(pollDecision,1000);
+}
+pollDecision();
+
+function toggleDecision(){
+  fetch('/api/decision/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.json()).then(d=>{
+    log('DECISION '+(d.enabled?'ENABLED':'DISABLED'));
+    pollDecision();
+  });
+}
+function setDecTarget(label){
+  fetch('/api/decision/target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label||null})}).then(r=>r.json()).then(d=>{
+    log('TARGET: '+(d.target_label||'ANY'));
+    pollDecision();
+  });
+}
+
 // ═══ Log ═══
 function log(m){
   var el=document.getElementById('log');
@@ -943,6 +1207,33 @@ class Handler(BaseHTTPRequestHandler):
                         "joints": [list(j[0]), list(j[1]), list(j[2])],
                         "l1": scara.l1, "l2": scara.l2,
                         "minReach": scara.min_r, "maxReach": scara.max_r})
+        elif p == "/stream_det":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            import cv2
+            try:
+                while True:
+                    frame = get_det_frame()
+                    if frame is None:
+                        time.sleep(0.05)
+                        continue
+                    _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                    data = jpeg.tobytes()
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
+                    self.wfile.write(f"Content-Length: {len(data)}\r\n\r\n".encode())
+                    self.wfile.write(data)
+                    self.wfile.write(b"\r\n")
+                    time.sleep(1.0 / CAMERA_FPS)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+        elif p == "/api/detections":
+            dets = get_detections()
+            tick_decision()
+            self._json({"detections": dets, "count": len(dets)})
+        elif p == "/api/decision":
+            self._json(decision.snapshot())
         else:
             self.send_response(404)
             self.end_headers()
@@ -995,6 +1286,14 @@ class Handler(BaseHTTPRequestHandler):
             r3 = can_bus.open()
             self._json({"robot": r1, "can": r3})
 
+        elif p == "/api/decision/toggle":
+            on = decision.toggle()
+            self._json({"enabled": on})
+
+        elif p == "/api/decision/target":
+            decision.target_label = body.get("label", None)
+            self._json({"target_label": decision.target_label})
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -1044,6 +1343,12 @@ def main():
     threading.Thread(target=capture_loop, args=(args.camera, CAMERA_W, CAMERA_H, CAMERA_FPS), daemon=True).start()
     _frame_event.wait(timeout=5)
     _frame_event.clear()
+
+    # YOLO Detector
+    if detector.yolo_ok:
+        status.set("YOLO Vision", True, f"YOLOv8n loaded ({len(detector.names)} classes)")
+    else:
+        status.set("YOLO Vision", True, "Color-blob fallback (install ultralytics for YOLO)")
 
     # SCARA
     status.set("SCARA", True, f"L1={scara.l1}mm L2={scara.l2}mm [{scara.min_r:.0f}..{scara.max_r:.0f}]mm")
